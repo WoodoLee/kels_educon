@@ -167,3 +167,132 @@ def make_embbeding_networks(sample_datas,hidden_features = 100, out_features = 7
 #     attn_mask = attn_mask.unsqueeze(1).expand(-1,seq_len+1,-1)
 #     attn_mask = attn_mask.unsqueeze(1)
 #     return attn_mask
+
+def accuracy_roughly(y_pred, y_label):
+    if len(y_pred) != len(y_label):
+        print("not available, fit size first")
+        return
+    cnt = 0
+    correct = 0
+    for pred, label in zip(y_pred, y_label):
+        cnt += 1
+        if abs(pred-label) <= 1:
+            correct += 1
+    return correct / cnt
+
+
+
+def train_net(model,train_loader,test_loader,optimizer_cls = optim.AdamW, criterion = nn.CrossEntropyLoss(),
+n_iter=10,device='cpu',lr = 0.001,weight_decay = 0.01,mode = None):
+        
+        train_losses = []
+        train_acc = []
+        val_accs = []
+        positive_accs = []
+        #optimizer = optimizer_cls(model.parameters(),lr=lr,weight_decay=weight_decay)
+        optimizer = optimizer_cls(model.parameters(),lr=lr)
+        #scheduler = optim.lr_scheduler.MultiStepLR(optimizer,milestones=[25,40,60,80], gamma=0.5,last_epoch=-1)
+        
+
+        for epoch in range(n_iter):
+                running_loss = 0.0
+                model.train()
+                n = 0
+                n_acc = 0
+                ys = []
+                ypreds = []
+                for i,(xx,(label_E,label_K,label_M)) in tqdm(enumerate(train_loader)):
+
+                
+                
+                        xx = xx.to(device)
+                        if mode == 'E':
+                                yy = label_E
+                        elif mode == 'K':
+                                yy = label_K
+                        elif mode == 'M':
+                                yy = label_M
+                        else:
+                                assert True
+                        
+                        yy = yy.to(device)
+                        
+
+                        
+                        
+                
+                        optimizer.zero_grad()
+                        outputs = model(xx)
+                        _,y_pred = outputs.max(1)
+
+                        loss1 = criterion(outputs,yy)
+                        loss2 = criterion(outputs,(yy+1).clamp(max=8))
+                        loss3 = criterion(outputs,(yy-1).clamp(min=0))
+                        loss = loss1 + loss2 + loss3
+
+                        # Getting gradients w.r.t. parameters
+                        loss.backward()
+
+                        # Updating parameters
+                        optimizer.step()
+                        ys.append(yy)
+                        ypreds.append(y_pred)
+                        
+                        
+                        i += 1
+                        n += len(xx)
+                        _, y_pred = outputs.max(1)
+                        n_acc += (yy == y_pred).float().sum().item()
+                #scheduler.step()
+                train_losses.append(running_loss/i)
+                train_acc.append(n_acc/n)
+                ys = torch.cat(ys)
+                ypreds = torch.cat(ypreds)
+                train_positive_acc = accuracy_roughly(ypreds,ys)
+                acc, positive_acc = eval_net(model,test_loader,device,mode = mode)
+                val_accs.append(acc)
+                positive_accs.append(positive_acc)
+
+                print(f'epoch : {epoch},train_positive_acc : {train_positive_acc} train_acc : {train_acc[-1]}, acc : {val_accs[-1]}. positive_acc : {positive_accs[-1]}',flush = True)
+
+        return np.array(val_accs), np.array(positive_accs)
+
+def eval_net(model,data_loader,device,mode=None):
+    model.eval()
+    ys = []
+    ypreds = []
+    for xx,(label_E,label_K,label_M) in data_loader:
+
+                
+                
+        xx = xx.to(device)
+        if mode == 'E':
+            y = label_E
+        elif mode == 'K':
+            y = label_K
+        elif mode == 'M':
+            y = label_M
+        else:
+            assert True
+        
+        y = y.to(device)
+
+        with torch.no_grad():
+                score = model(xx)
+                _,y_pred = score.max(1)
+        ys.append(y)
+        ypreds.append(y_pred)
+
+    ys = torch.cat(ys)
+    ypreds = torch.cat(ypreds)
+    positive_acc = accuracy_roughly(ypreds,ys)
+    acc= (ys == ypreds).float().sum() / len(ys)
+
+    # print(sklearn.metrics.confusion_matrix(ys.numpy(),ypreds.numpy()))
+
+
+    # print(sklearn.metrics.classification_report(ys.numpy(),ypreds.numpy()))
+    
+
+    return acc, positive_acc
+    #return acc.item()

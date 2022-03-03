@@ -1,174 +1,113 @@
 import torch
+import pandas as pd
+import sklearn
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.utils.data as D
-import argparse
-from models.LSTM import *
-from utils.dataloader import *
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import KFold
+from tqdm import tqdm
+from torch.utils.data import Dataset,DataLoader
+from utils.nn_utils import *
+from models.LSTM import Recurrent_Classifier
+
+X_datapaths = ['./preprocessed/prepared/nan/L2Y1.pkl','./preprocessed/prepared/nan/L2Y2.pkl','./preprocessed/prepared/nan/L2Y3.pkl','./preprocessed/prepared/nan/L2Y4.pkl','./preprocessed/prepared/nan/L2Y5.pkl','./preprocessed/prepared/nan/L2Y6.pkl']
+label_datapath = './preprocessed/prepared/nan/label.pkl'
+#X_datapaths = ['./preprocessed/prepared/fill/L2Y1.pkl','./preprocessed/prepared/fill/L2Y2.pkl','./preprocessed/prepared/fill/L2Y3.pkl','./preprocessed/prepared/fill/L2Y4.pkl','./preprocessed/prepared/fill/L2Y5.pkl','./preprocessed/prepared/fill/L2Y6.pkl',]
+#label_datapath = './preprocessed/prepared/fill/label.pkl'
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--cpu', action='store_true',help='run in cpu') 
+
+# read pickle
+input_datas = [] # list of each input pandas dataframe
+for datapath in X_datapaths:
+    temp = pd.read_pickle(datapath)
+    temp = temp.reset_index()
+    temp = temp.drop(columns=['index'])
+    input_datas.append(temp)
 
 
-GPU_NUM = 0
-args = parser.parse_args()
-if args.cpu:
-    device = torch.device('cpu')
-else:
-    device = torch.device('cuda')
-    print(torch.cuda.get_device_name(GPU_NUM), "allocated in ", torch.cuda.current_device())
-# if torch.cuda.is_available():
-#     device = 'cuda'
-# else:
-#     device = 'cpu'
+label_data = pd.read_pickle(label_datapath)
+label_data = label_data.reset_index()
+label_data = label_data.drop(columns=['index'])
 
-# bulid dataset
-root_dir = './preprocessed/merge/outer'
-# root_dir = './preprocessed/merge/inner'
-# root_dir = '../KELS_data/preprocessed/merge/outer'
 
-dataset = KELS(root_dir=root_dir)
-train_sampler, val_sampler, test_sampler = train_val_test_split(dataset, test_size=300, val_ratio=.2)   #outer
-# train_sampler, val_sampler, test_sampler = train_val_test_split(dataset, test_size=50, val_ratio=.2)  #inner
 
-train_loader = D.DataLoader(dataset=dataset, sampler=train_sampler, shuffle=False)
-val_loader = D.DataLoader(dataset=dataset, sampler=val_sampler, shuffle=False)
-test_loader = D.DataLoader(dataset=dataset, sampler=test_sampler, shuffle=False)
+split_list = make_split_list(input_datas)
+input_concated = np.concatenate(input_datas,axis=1) # concated input. (number of instance x number of features) will be splited with kfold
+seq_len = len(input_datas)
+label_data = label_data - 1
 
-### INNER
-# print(len(train_loader))    -> 568
-# print(len(val_loader))      -> 142
-# print(len(test_loader))     -> 50
 
-### OUTER
-# print(len(train_loader))  -> 5485
-# print(len(val_loader))    -> 1371
-# print(len(test_loader))   -> 300
 
-def sample2tensor(sample, standard=25):
-    if not sample['year']:
-        # print("="*20,'YEAR NAN DETECTED', "="*20)
-        return
+CLS2IDX = {
+    0 : '1등급',
+    1 : '2등급',
+    2 : '3등급',
+    3 : '4등급',
+    4 : '5등급',
+    5 : '6등급',
+    6 : '7등급',
+    7 : '8등급',
+    8 : '9등급'
+}
+is_regression = False
+
+batch_size = 32
+hidden_features = 64
+embbed_dim = 32
+n_splits = 10
+kfold = KFold(n_splits=n_splits)
+fold_acc_dict = {}
+epoch = 50
+
+for fold,(train_idx,test_idx) in enumerate(kfold.split(input_concated)):
+    print('------------fold no---------{}----------------------'.format(fold))
+    train_subsampler = torch.utils.data.SubsetRandomSampler(train_idx)
+    test_subsampler = torch.utils.data.SubsetRandomSampler(test_idx)
+    dataset = KELSDataSet(input_concated,label_data)
+    train_loader = DataLoader(
+                        dataset, 
+                        batch_size=batch_size, sampler=train_subsampler)
+    test_loader = DataLoader(
+                        dataset,
+                        batch_size=batch_size, sampler=test_subsampler)
+    sample_loader = DataLoader(dataset,batch_size=batch_size,shuffle=True)
+    assert batch_size
+    (sample,label) = next(iter(sample_loader))
+    sample_datas = batch_to_splited_datas(sample,split_list)
+    model_LSTM = Recurrent_Classifier.RecurrentClassifier(sample_datas,split_list,embedding_dim=embbed_dim,hidden_dim=hidden_features,output_size=9)
+    model_LSTM = model_LSTM.to(device)
+    val_accs , positive_accs = train_net(model_LSTM,train_loader,test_loader,n_iter=epoch,device=device,mode='E',lr=0.0001,optimizer_cls = optim.AdamW)
     
-    year = torch.cat(sample['year'])
-    input = sample['input']
-    label = sample['label']
+    temp_dict = {}
+    temp_dict['val_accs'] = val_accs
+    temp_dict['positive_accs'] = positive_accs
+    fold_acc_dict[fold] = temp_dict
+
+ 
     
-    flag = False
-    # years, inputs, labels = [], [], []
-    
-    for y in year:
-        input_ = torch.cat([v for k, v in input[int(y)].items()])
-        # order of label (E, K, M)
-        label_ = torch.cat([v for k, v in label[int(y)].items()])
-        
-        if torch.any(torch.isnan(input_)) or torch.any(torch.isnan(label_)):
-            print("="*10,'INPUT NAN DETECTED', "="*10)
-            print(sample)
-    
-        else:
-            if not flag:
-                flag = True
-                years, inputs, labels = y.unsqueeze(0), input_[:standard].float(), label_.float()
-            else:
-                years = torch.cat([years, y.unsqueeze(0)])
-                inputs = torch.cat([inputs, input_[:standard]])
-                labels = torch.cat([labels, label_])
-                
-                
-            # years.append(int(y))
-            # inputs.append(input_)
-            # labels.append(label_)
 
-    return years, inputs.resize_(years.shape[0], standard), labels.resize_(years.shape[0], 3)
-        
-# hyperparameters for training
-epochs = 5
-columns_num = 25
-label_num = 4
-# sequence is variable
-batch_size = 1
+#embedding_networks : 년차별로 맞는 mlp 리스트. 리스트 내용물에 따라 인풋 채널 개수 다름.
+ # not used in traing; only used to initialize embbeding layer
 
-input_size = 5
-hidden_size = 10
+val_acc_mean = np.zeros_like(fold_acc_dict[0]['val_accs'])
+pos_acc_mean = np.zeros_list(fold_acc_dict[0]['positive_accs'])
+for i in len(range(fold_acc_dict)):
+    val_acc_mean += fold_acc_dict[i]['val_accs']
+    pos_acc_mean += fold_acc_dict[i]['positive_accs']
 
-model = KELS_LSTM_(input_size=columns_num, hidden_size=label_num, batch_size=batch_size, device=device)
-model.to(device)
-optimizer = optim.Adam(model.parameters(), lr=.01)
-criterion = nn.CrossEntropyLoss()
+val_acc_mean = val_acc_mean / n_splits
+pos_acc_mean = pos_acc_mean / n_splits
 
-#save parameters
-path_save = './models/LSTM'
-save_period = 10
-best_acc = 0
-best_model = model
+for i in range(len(epoch)):
 
-for epoch in range(1, epochs+1):
-    # TRAIN
-    model.train()
-    for idx, sample in enumerate(train_loader):
-        samples = sample2tensor(sample)
-        if not samples is None:
-            year, input, label = samples
-            model.zero_grad()
-            
-            # label for English
-            label = label[:, 0].unsqueeze(-1)-1
-            label = F.one_hot(label.to(torch.int64), num_classes=4).squeeze(1).to(device)
-            label = torch.tensor(label, dtype=torch.float32).to(device)
-            #label = label[-1].unsqueeze(1)
-            # print(label)
+    print("-----------------------------------------------------------------------------------------------------")
+    print(f"mean          accuracy across {n_splits} fold in {i}th epoch : {val_acc_mean[i]}%")
+    print(f"mean positive accuracy across {n_splits} fold in {i}th epoch : {pos_acc_mean[i]}%")
+    print("-----------------------------------------------------------------------------------------------------")
 
-            output = model(input, year)
-            
-            loss = criterion(output.unsqueeze(0), label[-1].unsqueeze(0))
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-    # print log
-    print("EPOCH: %d / %d, LOSS: %f" % (epoch, epochs, loss.item()))
-    
-            
-    if epoch % save_period == 0:
-        torch.save(model, os.path.join(path_save,'LSTM'+str(epoch)+'.pt'))
-        
-    # VALIDATION
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for idx, sample in enumerate(val_loader):
-            samples = sample2tensor(sample)
-            if not samples is None:
-                year, input, label = samples
-                
-                # get label (English grade)
-                label = label[:, 0].unsqueeze(-1)-1
-                label = F.one_hot(label.to(torch.int64), num_classes=4).squeeze(1).to(device)
-                label = torch.tensor(label, dtype=torch.float32).to(device)
-                label = label[-1].unsqueeze(0)
-                
-                output = model(input, year)
-                
-                
-                pred = torch.argmax(output)
-                label = torch.argmax(label)
-
-                # predict last year
-                if pred == label:
-                # if torch.all(torch.eq(output, label)):
-                    correct += 1
-                total += 1 
-
-    acc = correct / total
-    print("EPOCH: %d / %d, ACCURACY: %.6f" % (epoch, epochs, acc))
-        
-    if acc > best_acc:
-        best_acc = acc
-        best_model = model
-        
